@@ -34,13 +34,18 @@ def unet_maps(dev, imgs, nets, mu, sd, bb):
     return P.astype(np.float16), G
 
 
-def cached_unet(split, dev, imgs, get_ctx):
-    p = f'cache_v2/unet_{split}.npz'
-    if not os.path.exists(p):
-        P, G = unet_maps(dev, imgs, *get_ctx())
-        np.savez_compressed(p, P=P, G=G)
-    z = np.load(p)
-    return z['P'].astype(np.float32), z['G']
+def cached_unet(split, dev, imgs, get_ctx, tags=('unet',)):
+    """Srednia map z kilku zestawow U-Netow (cache_v2/{tag}_{split}.npz); 'unet' = modele_natrenowane/."""
+    P = G = 0
+    for tag in tags:
+        p = f'cache_v2/{tag}_{split}.npz'
+        if not os.path.exists(p):
+            assert tag == 'unet', f'brak {p} (uruchom train_v3.py)'
+            Pu, Gu = unet_maps(dev, imgs(), *get_ctx())
+            np.savez_compressed(p, P=Pu, G=Gu)
+        z = np.load(p)
+        P = P + z['P'].astype(np.float32) / len(tags); G = G + z['G'] / len(tags)
+    return P, G
 
 
 def box_sum(I, b):
@@ -89,7 +94,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--out', default='sub_v2.csv')
     ap.add_argument('--alpha', type=float, default=1.0, help='wykladnik mapy przyczynowej (0 = sam U-Net)')
+    ap.add_argument('--unet', default='unet', help="zestawy map U-Neta do usrednienia, np. 'unet,unet3'")
+    ap.add_argument('--refine', action='store_true', help='dopracuj krawedzie ramek testem przyczynowym (~15 min)')
     a = ap.parse_args()
+    tags = a.unet.split(',')
     dev = 'cuda' if torch.cuda.is_available() else 'cpu'
     os.makedirs('cache_v2', exist_ok=True)
     rows = train_rows()
@@ -116,7 +124,7 @@ def main():
             ctx['v'] = (nets, mu, sd, bb)
         return ctx['v']
 
-    Pv, Gv = cached_unet('val', dev, load_imgs([rows[i]['id'] for i in va], 'train'), get_ctx)
+    Pv, Gv = cached_unet('val', dev, lambda: load_imgs([rows[i]['id'] for i in va], 'train'), get_ctx, tags)
     Cv = np.load('cache_v2/causal_val.npy').astype(np.float32); Sv = np.load('cache_v2/causal_val_st.npy')
     gt = [rows[i]['box'] for i in va]
     bv, Fv = analyse(Pv, Gv, Cv, Sv, a.alpha)
@@ -133,10 +141,24 @@ def main():
     if not os.path.exists('cache_v2/causal_test.done') or int(open('cache_v2/causal_test.done').read()) < 5000:
         print('brak pelnych map przyczynowych testu - koniec'); return
     ids = test_ids()
-    Pt, Gt = cached_unet('test', dev, load_imgs(ids, 'test'), get_ctx)
+    Pt, Gt = cached_unet('test', dev, lambda: load_imgs(ids, 'test'), get_ctx, tags)
     Ct = np.load('cache_v2/causal_test.npy').astype(np.float32); St = np.load('cache_v2/causal_test_st.npy')
     bt, Ft = analyse(Pt, Gt, Ct, St, a.alpha)
     out, t, _ = fit_and_score(Fv, gt, bv, Ft, bt)
+    if a.refine:
+        import refine_v2 as R
+        bb = E.load_backbone(D, dev)
+        adv = np.nonzero(has)[0]
+        Uv = load_imgs([rows[va[i]]['id'] for i in adv], 'train')
+        Tv = R.table(bb, Uv, Pv[adv, 1], Cv[adv], dev)
+        prm = R.tune(Tv, [gt[i] for i in adv])
+        print(f'dopracowanie krawedzi: walidacja IoU {np.mean([punkty(gt[i], bv[i]) for i in adv]):.3f} -> '
+              f'{np.mean([punkty(gt[i], r[R.choose(F, *prm)]) for i, (r, F) in zip(adv, Tv)]):.3f} (parametry {prm})')
+        sel = [i for i, o in enumerate(out) if o != NONE]
+        Ut = load_imgs([ids[i] for i in sel], 'test')
+        Tt = R.table(bb, Ut, Pt[sel, 1], Ct[sel], dev)
+        for i, (r, F) in zip(sel, Tt):
+            out[i] = r[R.choose(F, *prm)]
     with open(a.out, 'w', newline='') as fh:
         w = csv.writer(fh); w.writerow(['id', 'x_min', 'y_min', 'x_max', 'y_max'])
         for iid, b in zip(ids, out):
