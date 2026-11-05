@@ -52,16 +52,50 @@ def table(bb, U8, P1, C, dev):
     return T
 
 
+def score(F, al, ga):
+    return np.tanh(F[:, 0]) - al * F[:, 1] + ga * F[:, 2]
+
+
 def choose(F, al, ga):
-    return int(np.argmax(np.tanh(F[:, 0]) - al * F[:, 1] + ga * F[:, 2]))
+    return int(np.argmax(score(F, al, ga)))
+
+
+def _iou_mat(rects):
+    n = len(rects)
+    M = np.zeros((n, n), np.float64)
+    for i, a in enumerate(rects):
+        aa = (a[2] - a[0]) * (a[3] - a[1])
+        for j in range(i, n):
+            b = rects[j]
+            w = max(0, min(a[2], b[2]) - max(a[0], b[0]))
+            h = max(0, min(a[3], b[3]) - max(a[1], b[1]))
+            inter = w * h
+            bb = (b[2] - b[0]) * (b[3] - b[1])
+            M[i, j] = M[j, i] = inter / (aa + bb - inter) if inter else 0.0
+    return M
+
+
+def choose_mbr(rects, F, al, ga, temp):
+    """Softmax po wyniku → wariant max. oczekiwane IoU względem rozkladu w."""
+    s = score(F, al, ga)
+    t = max(float(temp), 1e-6)
+    w = np.exp((s - s.max()) / t); w /= w.sum()
+    return int(np.argmax(_iou_mat(rects) @ w))
 
 
 GRID = [(al, ga) for al in (0, .02, .05, .1, .2, .4) for ga in (0, 1, 2, 4, 8, 16, 1e6)]
+TEMPS = (0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0)
 
 
 def tune(T, gts):
     best = max(GRID, key=lambda p: np.mean([punkty(g, r[choose(F, *p)]) for (r, F), g in zip(T, gts)]))
     return best
+
+
+def tune_mbr(T, gts, al, ga):
+    """Strojenie temperatury MBR przy ustalonych (al, ga)."""
+    return max(TEMPS, key=lambda t: np.mean(
+        [punkty(g, r[choose_mbr(r, F, al, ga, t)]) for (r, F), g in zip(T, gts)]))
 
 
 if __name__ == '__main__':
@@ -83,4 +117,13 @@ if __name__ == '__main__':
         p = tune([T[i] for i in tr], [G[i] for i in tr])
         for i in te:
             cv[i] = punkty(G[i], T[i][0][choose(T[i][1], *p)])
-    print(f'start {st:.3f}  po dopracowaniu (5-fold CV) {cv.mean():.3f}  wyrocznia {orc:.3f}  parametry (calosc): {tune(T, G)}')
+    prm = tune(T, G)
+    cv_mbr = np.zeros(len(T))
+    for k in range(5):
+        tr = np.nonzero(fold != k)[0]; te = np.nonzero(fold == k)[0]
+        p = tune([T[i] for i in tr], [G[i] for i in tr])
+        t_ = tune_mbr([T[i] for i in tr], [G[i] for i in tr], *p)
+        for i in te:
+            r, F = T[i]; cv_mbr[i] = punkty(G[i], r[choose_mbr(r, F, *p, t_)])
+    print(f'start {st:.3f}  po dopracowaniu (5-fold CV) {cv.mean():.3f}  MBR {cv_mbr.mean():.3f}  '
+          f'wyrocznia {orc:.3f}  parametry (calosc): {prm}  T_mbr={tune_mbr(T, G, *prm)}')

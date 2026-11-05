@@ -96,6 +96,8 @@ def main():
     ap.add_argument('--alpha', type=float, default=1.0, help='wykladnik mapy przyczynowej (0 = sam U-Net)')
     ap.add_argument('--unet', default='unet', help="zestawy map U-Neta do usrednienia, np. 'unet,unet3'")
     ap.add_argument('--refine', action='store_true', help='dopracuj krawedzie ramek testem przyczynowym (~15 min)')
+    ap.add_argument('--mbr', action='store_true',
+                    help='z --refine: wybierz wariant max. oczekiwanego IoU (softmax po wyniku/T)')
     a = ap.parse_args()
     tags = a.unet.split(',')
     dev = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -152,13 +154,25 @@ def main():
         Uv = load_imgs([rows[va[i]]['id'] for i in adv], 'train')
         Tv = R.table(bb, Uv, Pv[adv, 1], Cv[adv], dev)
         prm = R.tune(Tv, [gt[i] for i in adv])
-        print(f'dopracowanie krawedzi: walidacja IoU {np.mean([punkty(gt[i], bv[i]) for i in adv]):.3f} -> '
-              f'{np.mean([punkty(gt[i], r[R.choose(F, *prm)]) for i, (r, F) in zip(adv, Tv)]):.3f} (parametry {prm})')
+        temp = R.tune_mbr(Tv, [gt[i] for i in adv], *prm) if a.mbr else None
+        def pick(r, F):
+            return r[R.choose_mbr(r, F, *prm, temp)] if a.mbr else r[R.choose(F, *prm)]
+        # uczciwa ocena refine: 5-fold CV (takze T dla MBR)
+        fold = np.random.default_rng(1).integers(0, 5, len(adv)); cv_iou = np.zeros(len(adv))
+        for k in range(5):
+            tr, te = np.nonzero(fold != k)[0], np.nonzero(fold == k)[0]
+            p = R.tune([Tv[i] for i in tr], [gt[adv[i]] for i in tr])
+            t_ = R.tune_mbr([Tv[i] for i in tr], [gt[adv[i]] for i in tr], *p) if a.mbr else None
+            for i in te:
+                r, F = Tv[i]
+                cv_iou[i] = punkty(gt[adv[i]], r[R.choose_mbr(r, F, *p, t_)] if a.mbr else r[R.choose(F, *p)])
+        print(f'dopracowanie krawedzi{"+MBR" if a.mbr else ""}: IoU {np.mean([punkty(gt[i], bv[i]) for i in adv]):.3f} -> '
+              f'{cv_iou.mean():.3f} (5-fold CV; parametry {prm}' + (f', T={temp}' if a.mbr else '') + ')')
         sel = [i for i, o in enumerate(out) if o != NONE]
         Ut = load_imgs([ids[i] for i in sel], 'test')
         Tt = R.table(bb, Ut, Pt[sel, 1], Ct[sel], dev)
         for i, (r, F) in zip(sel, Tt):
-            out[i] = r[R.choose(F, *prm)]
+            out[i] = pick(r, F)
     with open(a.out, 'w', newline='') as fh:
         w = csv.writer(fh); w.writerow(['id', 'x_min', 'y_min', 'x_max', 'y_max'])
         for iid, b in zip(ids, out):

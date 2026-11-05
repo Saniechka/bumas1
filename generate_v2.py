@@ -24,7 +24,8 @@ from PIL import Image
 
 EPS_GRID = [2, 3, 4, 6, 8, 10, 12, 16, 20]             # /255, siatka organizatora, rosnaco
 ATTACKS = ['pgd_u', 'pgd_t', 'mifgsm', 'cw']
-ATTACK_P = [0.2, 0.4, 0.2, 0.2]                         # pgd_t czesciej sie nie udaje -> czesciej losowany
+# Wagi przed odrzuceniem: pgd_t i mifgsm odpadaja czesciej; cel ~25% kazdego w zapisie.
+ATTACK_P = [0.18, 0.40, 0.26, 0.16]
 
 
 def load_backbone(data, dev):
@@ -164,16 +165,25 @@ def main():
     jobs = []
     for bid, u8, dec in bases:
         for k in range(a.per_base):
-            # wiecej latek niz 80%, bo czesc atakow odpada; JPEG: polowa jak trening, polowa jak trudny test
+            # wiecej latek niz 80%, bo czesc atakow odpada; JPEG: ~19% q80-88 jak trudny test, reszta q90-95
             jobs.append(dict(bid=bid, u8=u8, dec=list(dec), k=k,
-                             kind=rng.choice(['patch', 'decoy', 'clean'], p=[0.86, 0.07, 0.07]),
-                             q=int(rng.integers(90, 96)) if rng.random() < 0.5 else int(rng.integers(75, 89)),
+                             kind=rng.choice(['patch', 'decoy', 'clean'], p=[0.92, 0.04, 0.04]),
+                             q=int(rng.integers(90, 96)) if rng.random() < 0.81 else int(rng.integers(80, 89)),
                              atk=rng.choice(ATTACKS, p=ATTACK_P)))
+    progress_path = os.path.join(a.out, '.progress')
+    start_s = int(open(progress_path).read()) if os.path.exists(progress_path) else 0
     out_rows, t0 = [], time.time()
-    fh = open(os.path.join(a.out, 'train_labels.csv'), 'w', newline='')
-    wr = csv.writer(fh); wr.writerow(['id', 'split', 'usage', 'tier', 'x_min', 'y_min', 'x_max', 'y_max', 'comment'])
+    labels_path = os.path.join(a.out, 'train_labels.csv')
+    if start_s > 0 and os.path.exists(labels_path):
+        out_rows = [r['id'] for r in csv.DictReader(open(labels_path))]
+        fh = open(labels_path, 'a', newline=''); wr = csv.writer(fh)
+        print(f'wznowienie od job {start_s}/{len(jobs)}, juz zapisano {len(out_rows)}', flush=True)
+    else:
+        start_s = 0
+        fh = open(labels_path, 'w', newline='')
+        wr = csv.writer(fh); wr.writerow(['id', 'split', 'usage', 'tier', 'x_min', 'y_min', 'x_max', 'y_max', 'comment'])
 
-    for s in range(0, len(jobs), a.bs):
+    for s in range(start_s, len(jobs), a.bs):
         J = jobs[s:s + a.bs]
         # 1. prostokaty: latka + nowe wabiki, bez nakladania na istniejace wabiki
         for j in J:
@@ -208,16 +218,17 @@ def main():
                 xa = attack(model, x[idx], y[idx], tgt[idx], M, e / 255, atk, [qs[i] for i in idx], steps)
                 u = (xa * 255).round().byte().permute(0, 2, 3, 1).cpu().numpy()
                 with torch.no_grad():
-                    sv = torch.from_numpy(np.stack([jpeg_u8(u[n], qs[i]) for n, i in enumerate(idx)]))
+                    sv = torch.from_numpy(np.stack([jpeg_u8(u[n], qs[i]) for n, i in enumerate(idx)]).copy())
                     pz = model(sv.to(dev).permute(0, 3, 1, 2).float() / 255.).argmax(1).cpu().numpy()
                 for n, i in enumerate(idx):
                     if pz[n] != int(y[i]):            # dziala po zapisie -> to jest minimalne eps
-                        res[i] = (u[n], e)
+                        res[i] = (u[n].copy(), e)
             todo = [i for i in todo if res[i] is None]
         # 3. wabiki + JPEG + kontrola: latka myli model, wabiki nie
         def pred_of(u8):
             with torch.no_grad():
-                return int(model(torch.from_numpy(u8).to(dev).permute(2, 0, 1)[None].float() / 255.).argmax())
+                t = torch.from_numpy(np.ascontiguousarray(u8)).to(dev).permute(2, 0, 1)[None].float() / 255.
+                return int(model(t).argmax())
         for i, j in enumerate(J):
             if j['patch'] and res[i] is None:
                 continue
@@ -249,10 +260,13 @@ def main():
             com = f"{head}; decoys: {len(all_dec)} {', '.join(all_dec)}; jpeg={j['q']}"
             wr.writerow([iid, 'train', '', 'synthetic', *b, com]); out_rows.append(iid)
         fh.flush()
+        open(progress_path, 'w').write(str(min(s + a.bs, len(jobs))))
         print(f'{min(s + a.bs, len(jobs))}/{len(jobs)}  zapisano {len(out_rows)}  {time.time() - t0:.0f}s', flush=True)
     fh.close()
     import shutil
     shutil.copy(os.path.join(a.data, 'model', 'classes.txt'), os.path.join(a.out, 'model', 'classes.txt'))
+    if os.path.exists(progress_path):
+        os.remove(progress_path)
     print('gotowe:', len(out_rows), 'obrazkow w', a.out)
 
 
