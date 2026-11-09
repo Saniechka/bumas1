@@ -1,6 +1,3 @@
-"""Liczy i zapisuje mapy przyczynowe (wariant 'usuwanie') dla walidacji lub testu.
-    python exp/causal_cache.py val|test
-Wynik: cache_v2/causal_{split}.npy (N,len(QS),64,64) float16 i cache_v2/causal_{split}_st.npy (N,len(QS),3)."""
 import os, sys, time
 import numpy as np
 import torch
@@ -10,9 +7,10 @@ from causal_map import win_masks
 
 QS = (30, 50)
 
+#tworzy sie mapa cieplna czułych punktow
 
 def compute_causal(bb, U8, path, dev='cuda', log=''):
-    """Wznawialne liczenie map dla tablicy uint8 (N,64,64,3) -> memmap path, path_st.npy, path.done."""
+    #przygotowanie
     N = len(U8)
     pst, pdone = path.replace('.npy', '_st.npy'), path.replace('.npy', '.done')
     if os.path.exists(pdone) and int(open(pdone).read()) >= N:
@@ -23,25 +21,26 @@ def compute_causal(bb, U8, path, dev='cuda', log=''):
     start = int(open(pdone).read()) if os.path.exists(pdone) else 0
     M = win_masks(dev); cnt = M.sum(0)
     t = time.time()
+
     with torch.no_grad():
         for n in range(start, N):
-            x = to_t(U8[n:n + 1]).to(dev)
-            fs = to_t(np.stack([jpeg_u8(U8[n], q) for q in QS])).to(dev)
+            x = to_t(U8[n:n + 1]).to(dev) # przesyła do gpu
+            fs = to_t(np.stack([jpeg_u8(U8[n], q) for q in QS])).to(dev) #skompresowane wersje obrazka w pamięci
             with torch.autocast('cuda', dtype=torch.float16):
-                z0 = bb(torch.cat([x, fs])).float()
-            c0 = z0[:1].argmax(1)
-            mg0 = margin(z0, c0.repeat(len(z0)))
+                z0 = bb(torch.cat([x, fs])).float() # odpowiedz dla oryginału i 2 wersji
+            c0 = z0[:1].argmax(1) # czysta odpowiedz
+            mg0 = margin(z0, c0.repeat(len(z0))) #pewność
             for j in range(len(QS)):
                 f = fs[j:j + 1]
                 md = []
-                for s in range(0, len(M), 512):
+                for s in range(0, len(M), 512): #  dzielimy okna na paczki po maks 512
                     m = M[s:s + 512, None]
                     with torch.autocast('cuda', dtype=torch.float16):
-                        md.append(margin(bb(x + m * (f - x)).float(), c0.repeat(len(m))))
+                        md.append(margin(bb(x + m * (f - x)).float(), c0.repeat(len(m)))) # zmywanie w oknie
                 md = torch.cat(md)
-                m0, mf = mg0[0].item(), mg0[1 + j].item()
-                drop = (m0 - md) / (abs(m0 - mf) + 0.5)
-                out[n, j] = (torch.einsum('w,wij->ij', drop, M) / cnt).cpu().numpy().astype(np.float16)
+                m0, mf = mg0[0].item(), mg0[1 + j].item() # pewność dla 2 wariantów
+                drop = (m0 - md) / (abs(m0 - mf) + 0.5) #wskaznik spadku pewnosci 
+                out[n, j] = (torch.einsum('w,wij->ij', drop, M) / cnt).cpu().numpy().astype(np.float16)#wskaźnik pewności dla maski siatek
                 st[n, j] = [m0, mf, drop.max().item()]
             if (n + 1) % 100 == 0 or n + 1 == N:
                 out.flush(); np.save(pst, st); open(pdone, 'w').write(str(n + 1))

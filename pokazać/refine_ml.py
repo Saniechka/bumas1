@@ -1,19 +1,6 @@
 """
-refine_ml.py - madrzejszy wybor krawedzi ramki (zamiast reguly z refine_v2).
-
-Dla kazdej ramki z gotowego zgloszenia sprawdzamy ok. 2000 wariantow (kazda krawedz
--3..+3 px) i model (gradient boosting) przewiduje IoU kazdego wariantu z prawdziwa latka.
-Wybieramy wariant z najwyzszym przewidywanym IoU.
-
-Model uczymy na TWOICH wygenerowanych obrazkach z synth_v2, ktorych train_v3 nie widzial
-(z 55 tys. uzyl 15 tys.) - wiec mamy tysiace przykladow z prawdziwa ramka zamiast 400.
-Uczciwy wynik podajemy na 400 prawdziwych obrazkach walidacji (model ich nie widzi).
-
-Uruchamiac z folderu kolega:
-    python solve_v2.py --unet unet,moj,unet3 --out sub_baza.csv        # decyzja ramka / 0,0,0,0
-    python refine_ml.py --sub sub_baza.csv --out sub_ml.csv
-
-Wszystkie etapy maja cache w cache_ref/ - po przerwaniu uruchom ta sama komende.
+każdą ramke  przesuwamy -+3 piksele
+ale to było uczone na naszych wygenerowanych danych
 """
 import argparse, csv, os, sys, time
 import numpy as np
@@ -83,7 +70,6 @@ def var_feats(rects, drops, p1, cz, b0):
 
 
 def build_table(bb, U8, P1, C, B0, path, gts=None, log_name=''):
-    """-> lista (rects, F, iou|None); cache w path (npz)."""
     if os.path.exists(path):
         z = np.load(path, allow_pickle=True)
         return list(z['T'])
@@ -103,7 +89,7 @@ def build_table(bb, U8, P1, C, B0, path, gts=None, log_name=''):
     return T
 
 
-# ------------------------------------------------------------------ modele
+
 bb = E.load_backbone(D, dev)
 rows_real = train_rows()
 perm = np.random.default_rng(0).permutation(len(rows_real))

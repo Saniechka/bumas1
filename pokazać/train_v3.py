@@ -1,12 +1,5 @@
 """
-P1 v3: U-Net uczony na 24 cechach z solve.py + 2 kanalach mapy przyczynowej (JPEG q30/q50),
-na prawdziwym treningu i danych z generate_v2.py. Wynik zapisuje w formacie solve_v2.py.
-
-    python generate_v2.py --data data/p1_student --out synth_v2 --per_base 8
-    python train_v3.py --synth synth_v2,synth_final --synth_max 6000,6000
-    python solve_v2.py --unet unet3 --out sub_v3.csv
-
-Wszystkie etapy maja cache w cache_v3/ i da sie je wznowic po przerwaniu.
+ U-Net uczony na 24 cechach i 2 kanalach mapy przyczynowej,
 """
 import argparse, csv, os, re, sys, time
 import numpy as np
@@ -25,13 +18,13 @@ def load_set(root, split, ids):
     return np.stack([E.load_u8(root, split, i) for i in ids])
 
 
-def feats_cache(bb, dev, imgs, path):
+def feats_cache(bb, dev, imgs, path): # zbiera cechy
     f, lg = E.cache_split(bb, dev, imgs, path, 128)
     return f, lg
 
 
 class Stack:
-    """Leniwe sklejenie cech (N,24,..) i znormalizowanych map przyczynowych (N,NC,..)."""
+    """sklejenie cech"""
     def __init__(self, f, c):
         self.f, self.c = f, c
         self.shape = (len(f), f.shape[1] + c.shape[1], 64, 64)
@@ -45,35 +38,38 @@ class Stack:
         return np.concatenate([np.asarray(self.f[b], np.float32), c], 1)
 
 
-def train(a, dev, X, rows, tr_idx, mu, sd, out_path, seed):
+def train(a, dev, X, rows, tr_idx, mu, sd, out_path, seed): 
     torch.manual_seed(seed)
     net = E.PatchUNet(cin=X.shape[1], w=a.width).to(dev)
     opt = torch.optim.AdamW(net.parameters(), lr=a.lr, weight_decay=1e-4)
     steps = max(1, len(tr_idx) // a.bs)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, a.lr, total_steps=a.epochs * steps)
-    wcls = torch.tensor([0.25, 1.0, 0.6], device=dev)
+    wcls = torch.tensor([0.25, 1.0, 0.6], device=dev) #: Wagi dla błędów. Sieć jest bardziej karana za przegapienie pikseli łatki
     masks = np.stack([E.label_mask(r) for r in rows]).astype(np.uint8)
-    has = np.array([r['box'] != NONE for r in rows], np.float32)
+    has = np.array([r['box'] != NONE for r in rows], np.float32) #ma czy nie łątkę
     mu_t, sd_t = torch.from_numpy(mu).to(dev), torch.from_numpy(sd).to(dev)
     rng = np.random.default_rng(seed)
     scaler_ctx = dict(device_type='cuda', dtype=torch.bfloat16, enabled=(dev != 'cpu'))
+    
     for ep in range(a.epochs):
         net.train(); perm = rng.permutation(tr_idx); tot = n = 0; t = time.time()
         for s in range(steps):
             b = np.sort(perm[s * a.bs:(s + 1) * a.bs])
             Xb = X[b]; M = masks[b].copy()
-            for j in range(len(b)):
+
+            for j in range(len(b)): #augmentacja
                 k = int(rng.integers(8))
                 Xb[j] = E.d4_np(Xb[j], k).copy(); M[j] = E.d4_np(M[j], k).copy()
             x = (torch.from_numpy(np.ascontiguousarray(Xb)).to(dev) - mu_t) / sd_t
             m = torch.from_numpy(np.ascontiguousarray(M).astype(np.int64)).to(dev)
             h = torch.from_numpy(has[b]).to(dev)
             with torch.autocast(**scaler_ctx):
-                logit, g = net(x)
+                logit, g = net(x) # gdzie jest łatka i czy jest łatka
             logit, g = logit.float(), g.float()
             loss = F.cross_entropy(logit, m, weight=wcls) \
                 + 0.5 * E.soft_dice(logit.softmax(1)[:, 1], (m == 1).float()) \
                 + 0.3 * F.binary_cross_entropy_with_logits(g, h)
+            #Backward Pass
             opt.zero_grad(); loss.backward(); opt.step(); sched.step()
             tot += loss.item() * len(b); n += len(b)
         print(f'   [seed {seed}] epoka {ep + 1}/{a.epochs}  strata {tot / n:.4f}  {time.time() - t:.0f}s', flush=True)
@@ -82,15 +78,15 @@ def train(a, dev, X, rows, tr_idx, mu, sd, out_path, seed):
 
 
 @torch.no_grad()
-def infer(nets, dev, X, mu, sd, bs=64):
+def infer(nets, dev, X, mu, sd, bs=64): # testowanie
     mu_t, sd_t = torch.from_numpy(mu).to(dev), torch.from_numpy(sd).to(dev)
     P = np.zeros((len(X), 3, 64, 64), np.float32); G = np.zeros(len(X), np.float32)
     for net in nets:
         net.eval()
-        for s in range(0, len(X), bs):
+        for s in range(0, len(X), bs): #paczki po 64 sztuki
             x = (torch.from_numpy(X[np.arange(s, min(s + bs, len(X)))]).to(dev) - mu_t) / sd_t
             acc = 0; gacc = 0
-            for k in range(8):
+            for k in range(8): # odbijanie obrazku na 8 sposobów TTA
                 with torch.autocast('cuda', dtype=torch.bfloat16, enabled=(dev != 'cpu')):
                     lg, g = net(E.d4_t(x, k))
                 acc = acc + E.d4_t_inv(lg.float().softmax(1), k); gacc = gacc + g.float()
@@ -98,7 +94,7 @@ def infer(nets, dev, X, mu, sd, bs=64):
     return P, G
 
 
-def report(name, P, gt, C=None):
+def report(name, P, gt, C=None): #sprawdzenie jak radzą porównując z ideałem
     has = [g != NONE for g in gt]
     iou = [punkty(g, best_rect(p[1])[0]) for p, g, h in zip(P, gt, has) if h]
     msg = f'   {name:22s} IoU(U-Net) {np.mean(iou):.3f}'
@@ -133,10 +129,10 @@ def main():
     torch.backends.cudnn.benchmark = True
     bb = E.load_backbone(D, dev)
 
-    # ---- dane: prawdziwy trening (te same 500 odlozone co w solve/ensemble4) + syntetyczne
+
     real = E.read_train(D)
     perm = np.random.default_rng(0).permutation(len(real))
-    va_real = np.sort(perm[:500])
+    va_real = np.sort(perm[:500]) # 500 obrazków na zbior walidacyjny
     rows = list(real)
     syn_val = []
     for k, (d, mx) in enumerate(zip(a.synth.split(','), map(int, a.synth_max.split(',')))):
@@ -159,7 +155,7 @@ def main():
     tr_idx = np.setdiff1d(np.arange(len(rows)), va_all)
     print(f'trening {len(tr_idx)}, walidacja: prawdziwa {len(va_real)}, syntetyczna {len(syn_val)}')
 
-    # ---- cechy i mapy przyczynowe (cache)
+    # ---- cechy i mapy
     print('[1/3] cechy i mapy przyczynowe')
     U = np.stack([E.load_u8(r['root'], 'train', r['id']) for r in rows])
     f_tr, _ = feats_cache(bb, dev, U, os.path.join(a.cache, 'f_train.npy'))

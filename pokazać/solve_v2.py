@@ -1,14 +1,10 @@
 """
-P1 v2: ensemble U-Netow (modele_natrenowane/) + mapa przyczynowa (exp/causal_cache.py).
 
-    python exp/causal_cache.py val && python exp/causal_cache.py test     # ~45 min na RTX 2060
-    python solve_v2.py --out sub_v2.csv
 
-Ramka: maksymalizacja oczekiwanego IoU na mapie P(latka) z U-Neta pomnozonej przez
+Ramka: maksymalizacja oczekiwanego IoU na mapie z U-Neta pomnozonej przez
 znormalizowana mape przyczynowa (spadek marginesu klasy modelu, gdy okno zastapimy
 wersja po mocnym JPEG). Latka ma minimalne eps, wiec jej usuniecie przywraca klase;
-usuniecie wabika nie zmienia nic. Decyzja ramka / 0,0,0,0: regresja logistyczna
-na cechach obrazka, prog strojony walidacja krzyzowa pod funkcje oceny.
+usuniecie wabika nie zmienia nic. 
 """
 import argparse, csv, os, sys
 import numpy as np
@@ -35,7 +31,6 @@ def unet_maps(dev, imgs, nets, mu, sd, bb):
 
 
 def cached_unet(split, dev, imgs, get_ctx, tags=('unet',)):
-    """Srednia map z kilku zestawow U-Netow (cache_v2/{tag}_{split}.npz); 'unet' = modele_natrenowane/."""
     P = G = 0
     for tag in tags:
         p = f'cache_v2/{tag}_{split}.npz'
@@ -53,11 +48,11 @@ def box_sum(I, b):
 
 
 def analyse(P, G, C, st, a):
-    """-> ramki, cechy obrazka (do decyzji)."""
+   
     boxes, feats = [], []
     for p, g, c, s in zip(P, G, C, st):
         cz = np.clip(c.mean(0), 0, None); cz = cz / (cz.max() + 1e-9)
-        pc = p[1] * cz ** a
+        pc = p[1] * cz ** a # dzięki temu obszary wzmacniane ai jem tam gdzie jpeg mocno zepsuł pewnośc
         b, v = best_rect(pc)
         ar = (b[2] - b[0]) * (b[3] - b[1])
         I1, I2, Ic = (integral(m.astype(np.float64)) for m in (p[1], p[2], cz))
@@ -73,7 +68,6 @@ def fit_and_score(Ftr, gt_tr, boxes_tr, Fte, boxes_te, gt_te=None, zero_frac=Non
     y = np.array([g != NONE for g in gt_tr], np.float64)
     lr = E.fit_logreg(Ftr, y)
     iou = np.array([punkty(g, b) for g, b in zip(gt_tr, boxes_tr)])
-    # oczekiwane IoU: liniowo z cech ramki, uczone na obrazkach z latka
     m = y == 1
     Xe = Ftr[m][:, [3, 5, 6, 12]]
     we = np.linalg.lstsq(Xe, iou[m], rcond=None)[0]

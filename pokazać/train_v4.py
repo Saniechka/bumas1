@@ -1,20 +1,12 @@
 """
-train_v4.py - U-Net v3 + uczenie KRAWEDZI ramki.
-
 Zmiany wzgledem train_v3.py (te same dane, cechy i mapy przyczynowe z --cache):
   1. Druga "glowa" sieci: kazdy piksel latki przewiduje odleglosc do lewej, gornej, prawej
      i dolnej krawedzi (jak detektor FCOS). Ramka = glosowanie setek pikseli -> dokladniejsze
      krawedzie niz dopasowanie prostokata do mapy prawdopodobienstwa.
-  2. Wieksza waga bledow na pikselach przy krawedzi latki (--edge_w).
-  3. Prawdziwe obrazki czesciej w treningu (--real_rep), bo test przypomina wlasnie je.
-  4. Start z gotowych wag v3 (--init), wiec wystarczy kilkanascie-kilkadziesiat epok.
+  2. Wieksza waga bledow na pikselach przy krawedzi latki .
+  3. Prawdziwe obrazki czesciej w treningu (--real_rep).
 
-Wynik:
-  cache_v2/unet4_val.npz, unet4_test.npz   - mapy jak z v3 (do solve_v2.py --unet ...,unet4)
-  cache_v2/unet4_box_val.npy, _test.npy    - ramki z glosowania (do apply_box.py)
 
-    python train_v4.py --synth ../bumas1/synth_v2 --synth_max 50000 --cache cache_v3_full \
-                       --init cache_v3_full/unet3_1.pt --epochs 25
 """
 import argparse, csv, os, sys, time
 import numpy as np
@@ -33,7 +25,7 @@ from causal_cache import compute_causal
 class BoxUNet(E.PatchUNet):
     def __init__(self, cin, w):
         super().__init__(cin=cin, w=w)
-        self.box = nn.Conv2d(w, 4, 1)
+        self.box = nn.Conv2d(w, 4, 1) # nowa warstwa
 
     def forward(self, x):
         e1 = self.e1(x)
@@ -45,13 +37,12 @@ class BoxUNet(E.PatchUNet):
         d3 = self.d3(torch.cat([up(e4), e3], 1))
         d2 = self.d2(torch.cat([up(d3), e2], 1))
         d1 = self.d1(torch.cat([up(d2), e1], 1))
-        dist = F.softplus(self.box(d1).float()) * 16.0      # odleglosci w pikselach (l, t, r, b)
+        dist = F.softplus(self.box(d1).float()) * 16.0     
         return self.out(d1), g, dist
 
 
 # =============================================================== geometria
-def d4_box(b, k):
-    """Ramka po tej samej operacji co E.d4_np/E.d4_t (najpierw transpozycja, potem odbicia)."""
+def d4_box(b, k): # przekształca ramki uwzgledniając odbocia i rotacje
     x0, y0, x1, y1 = b
     if k & 4: x0, y0, x1, y1 = y0, x0, y1, x1
     if k & 1: x0, x1 = 64 - x1, 64 - x0
@@ -62,8 +53,7 @@ def d4_box(b, k):
 GRID = (torch.arange(64).float() + 0.5)
 
 
-def box_targets(boxes, has):
-    """boxes (B,4) float, has (B,) -> odleglosci (B,4,64,64) i maska pikseli latki (B,64,64)."""
+def box_targets(boxes, has): # liczy jak daleko w pikselach każdy punkt  ma do poszczególnych krawędzi łątek
     g = GRID.to(boxes.device)
     X = g.view(1, 1, 64).expand(len(boxes), 64, 64)
     Y = g.view(1, 64, 1).expand(len(boxes), 64, 64)
@@ -73,7 +63,7 @@ def box_targets(boxes, has):
     return T, inside
 
 
-def iou_loss(pred, T, inside):
+def iou_loss(pred, T, inside): # kary za złe wyiczenie ramek pole styku i sumy
     if not inside.any():
         return pred.sum() * 0
     pl, pt, pr, pb = pred.unbind(1); tl, tt, tr, tb = T.unbind(1)
@@ -83,15 +73,14 @@ def iou_loss(pred, T, inside):
     return (1 - iou)[inside].mean()
 
 
-def dist_to_coords(dist):
-    """(B,4,64,64) odleglosci -> (B,4,64,64) bezwzgledne wspolrzedne ramki x0,y0,x1,y1."""
+def dist_to_coords(dist):# tak jak powinno wyglądać w końcowym pliku csv
     g = GRID.to(dist.device)
     X = g.view(1, 1, 64); Y = g.view(1, 64, 1)
     return torch.stack([X - dist[:, 0], Y - dist[:, 1], X + dist[:, 2], Y + dist[:, 3]], 1)
 
 
 def coords_inv(c, k):
-    """Wspolrzedne zapisane w ukladzie po d4(k) -> uklad oryginalny (odwrotnosc d4_box)."""
+    
     x0, y0, x1, y1 = c.unbind(1)
     if k & 2: y0, y1 = 64 - y1, 64 - y0
     if k & 1: x0, x1 = 64 - x1, 64 - x0
@@ -99,8 +88,7 @@ def coords_inv(c, k):
     return torch.stack([x0, y0, x1, y1], 1)
 
 
-def vote(p1, coords, thr=0.3):
-    """p1 (64,64) prawdop. latki, coords (4,64,64) -> ramka z glosowania lub None."""
+def vote(p1, coords, thr=0.3): # zbiera dla każdego piksela pozycje krawędzie i głosuje
     l = coords[0]; t = coords[1]
     w = np.where(p1 > thr, p1 ** 2, 0.0)
     if w.sum() < 1e-3:
@@ -112,7 +100,7 @@ def vote(p1, coords, thr=0.3):
     return (x0, y0, x1, y1)
 
 
-# =============================================================== trening
+
 def train(a, dev, X, rows, tr_idx, n_real, mu, sd, out_path, seed, init, eps=None):
     torch.manual_seed(seed)
     net = BoxUNet(cin=X.shape[1], w=a.width).to(dev)
@@ -123,7 +111,7 @@ def train(a, dev, X, rows, tr_idx, n_real, mu, sd, out_path, seed, init, eps=Non
     parts = [tr_idx] + [tr_real] * (a.real_rep - 1)
     if eps is not None and a.eps_boost > 1:
         weak = tr_idx[(eps[tr_idx] > 0) & (eps[tr_idx] <= a.eps_max)]
-        parts += [weak] * (a.eps_boost - 1)
+        parts += [weak] * (a.eps_boost - 1) # wiecej prawdziwych obrazków
         print(f'   slabe latki (eps <= {a.eps_max}/255): {len(weak)} obrazkow, pokazywane x{a.eps_boost}', flush=True)
     pool = np.concatenate(parts)
     opt = torch.optim.AdamW(net.parameters(), lr=a.lr, weight_decay=1e-4)
